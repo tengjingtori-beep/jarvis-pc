@@ -19,6 +19,7 @@ import ctypes
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -28,6 +29,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
+import zlib
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -54,6 +57,14 @@ except Exception:
     _sd = None
 
 VOICE_INPUT_AVAILABLE = _vosk is not None and _sd is not None
+
+# 動画づくり用の ffmpeg（imageio-ffmpeg 同梱バイナリ）も任意。無くてもアプリは動く。
+_imageio_ffmpeg = None
+try:
+    import imageio_ffmpeg as _iio_ffmpeg_mod
+    _imageio_ffmpeg = _iio_ffmpeg_mod
+except Exception:
+    _imageio_ffmpeg = None
 
 
 # ===========================================================================
@@ -132,6 +143,7 @@ _ACTION_PREFIXES = [
     ("明るさ", "brightness"),
     ("スクショ", "screenshot"),
     ("ページ", "page"),
+    ("動画", "make_video"),
     ("待つ", "wait"),
 ]
 
@@ -257,6 +269,8 @@ def parse_action(text):
             return {"type": "see_click", "name": rest}
         if kind == "page":
             return {"type": "page", "question": rest}
+        if kind == "make_video":
+            return {"type": "make_video", "theme": rest}
         if kind == "done":
             summary = rest if rest else body
             return {"type": "done", "summary": summary.strip()}
@@ -613,6 +627,7 @@ DEFAULT_CONFIG = {
     "agent_on": False,
     "listen_on": True,       # ずっと聞き耳（既定オン）
     "autostart": False,      # Windows起動時に自動で出す
+    "video_tate": True,      # 説明動画は縦長（1080x1920）。False で横長（1280x720）
     "n_predict": 1024,
     "temperature": 0.7,
 }
@@ -632,7 +647,7 @@ def load_config(path):
         cfg["speaker_id"] = int(cfg.get("speaker_id", 11))
     except (TypeError, ValueError):
         cfg["speaker_id"] = 11
-    for k in ("voice_on", "agent_on", "listen_on", "autostart"):
+    for k in ("voice_on", "agent_on", "listen_on", "autostart", "video_tate"):
         cfg[k] = bool(cfg.get(k, DEFAULT_CONFIG[k]))
     return cfg
 
@@ -1150,6 +1165,956 @@ def build_page_question(question, title, url, text):
         "----\n%s\n----\n"
         "質問: %s" % (title or "（不明）", url or "（不明）", text or "", question)
     )
+
+
+# ===========================================================================
+# 説明動画づくり（NotebookLM 風: 紙ノートの世界 + スライド + 読み上げ）
+# ===========================================================================
+# 全部このパソコンの中で作る。台本は手元のモデル、絵は Pillow の図形描画、
+# 声は VOICEVOX / SAPI、組み立ては imageio-ffmpeg 同梱の ffmpeg。
+# 実写の生成動画ではない（README に正直に書いてある）。
+# 手描き水彩の質感は図形描画では再現できない。狙うのは、レイアウトの整い方、
+# 字幕と声の同期、段階表示のリズム、デザインの統一感。
+
+VIDEO_SIZE_TATE = (1080, 1920)   # 縦長（参照動画と同じ。既定）
+VIDEO_SIZE_YOKO = (1280, 720)    # 横長（設定で選択）
+VIDEO_FPS = 30
+VIDEO_STAGE_PAD = 0.4            # 場面の最後に足す余韻（秒）
+VIDEO_FADE_SEC = 0.25            # 場面/段階の間のクロスフェード（秒）
+VIDEO_MAX_SCENES = 8
+
+# 紙ノートの色（クリーム色の紙 + 暖色の切り貼り）
+PAPER_BASE = (250, 244, 230)
+PAPER_DOT = (233, 221, 196)
+INK_COLOR = (74, 63, 53)
+CARD_PAPER = (255, 253, 247)
+NOTE_YELLOW = (253, 236, 166)
+TAPE_COLOR = (255, 240, 178, 150)
+SCRAP_COLORS = [
+    (242, 166, 90),    # オレンジ
+    (127, 179, 213),   # 水色
+    (245, 215, 110),   # 黄色
+    (242, 184, 198),   # ピンク
+    (168, 213, 186),   # ミント
+    (190, 178, 224),   # 薄紫
+]
+MOTIF_SOFT = (255, 250, 238)     # モチーフの下地の淡い紙色
+
+
+def ffmpeg_exe_path():
+    """同梱 ffmpeg（imageio-ffmpeg）のパス。無ければ PATH 上の ffmpeg、それも無ければ None。"""
+    if _imageio_ffmpeg is not None:
+        try:
+            p = _imageio_ffmpeg.get_ffmpeg_exe()
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    return shutil.which("ffmpeg")
+
+
+# ---------------------------------------------------------------------------
+# 台本（モデルに書かせる → 決まった形式で受ける）
+# ---------------------------------------------------------------------------
+
+VIDEO_SCRIPT_SYSTEM = (
+    "あなたは説明動画の台本作家です。頼まれたテーマについて、"
+    "スライドと読み上げで説明する動画の台本を書いてください。"
+    "場面は4つから6つ。必ず下の形式だけで答えてください。形式の外の文章は書かないでください。\n"
+    "---場面---\n"
+    "タイトル: その場面の短い見出し\n"
+    "絵: ロボット、チェックリスト、パソコン、キーボード、エンターキー、フォルダ、"
+    "ファイル、虫めがね、時計、本、電球、歯車 の中から、その場面に合うものを1つ\n"
+    "スライド:\n"
+    "・短い箇条書き（1行ずつ、2〜4行）\n"
+    "ナレーション: 読み上げる文章。2〜4文。やさしい日本語で、記号や箇条書きは入れない\n"
+    "（次の場面も同じ形で、---場面--- から始めてください）"
+)
+
+
+def build_video_script_prompt(theme):
+    """台本づくりのお願い文を作る。"""
+    return "テーマ: %s\nこのテーマで、説明動画の台本を書いてください。" % (theme or "")
+
+
+_SCENE_SEP_RE = re.compile(r"^\s*-{2,}\s*場面\s*-{2,}\s*$")
+_VIDEO_FIELD_RE = re.compile(r"^\s*(タイトル|絵|スライド|ナレーション)\s*[:：]\s*(.*)$")
+
+
+def parse_video_script(text):
+    """
+    モデルの台本を場面のリストに分ける。
+    戻り値: [{"title":..., "motif_raw":..., "bullets":[...], "narration":...}, ...]
+    形式が崩れていれば、取れた分だけ返す（呼び出し側で場面数を確かめる）。
+    """
+    cleaned = strip_think(text or "")
+    blocks = []
+    cur = None
+    for line in cleaned.splitlines():
+        if _SCENE_SEP_RE.match(line):
+            if cur is not None:
+                blocks.append(cur)
+            cur = []
+            continue
+        if cur is not None:
+            cur.append(line)
+    if cur is not None:
+        blocks.append(cur)
+
+    scenes = []
+    for block in blocks:
+        scene = {"title": "", "motif_raw": "", "bullets": [], "narration": ""}
+        field = None
+        narration_lines = []
+        for line in block:
+            m = _VIDEO_FIELD_RE.match(line)
+            if m:
+                field = m.group(1)
+                rest = m.group(2).strip()
+                if field == "タイトル":
+                    scene["title"] = rest
+                elif field == "絵":
+                    scene["motif_raw"] = rest
+                elif field == "ナレーション":
+                    if rest:
+                        narration_lines.append(rest)
+                continue
+            s = line.strip()
+            if not s:
+                continue
+            if field == "スライド":
+                b = re.sub(r"^[・\-*＊>＞\s]+", "", s).strip()
+                if b:
+                    scene["bullets"].append(b)
+            elif field == "ナレーション":
+                narration_lines.append(s)
+            elif field is None and not scene["title"]:
+                scene["title"] = s  # 形式が崩れた時の拾い読み
+        scene["narration"] = " ".join(narration_lines).strip()
+        scene["bullets"] = scene["bullets"][:4]
+        if scene["title"] or scene["narration"]:
+            scenes.append(scene)
+    return scenes
+
+
+# ---------------------------------------------------------------------------
+# モチーフ（絵）の選択
+# ---------------------------------------------------------------------------
+
+MOTIF_NAMES = ("robot", "checklist", "laptop", "keyboard", "enter", "folder",
+               "document", "magnifier", "clock", "book", "bulb", "gear")
+
+_MOTIF_JA = {
+    "ロボット": "robot", "チェックリスト": "checklist", "チェック": "checklist",
+    "やることリスト": "checklist", "パソコン": "laptop", "ノートパソコン": "laptop",
+    "PC": "laptop", "キーボード": "keyboard", "エンターキー": "enter",
+    "エンター": "enter", "フォルダ": "folder", "ファイル": "document",
+    "ドキュメント": "document", "文書": "document", "虫めがね": "magnifier",
+    "虫眼鏡": "magnifier", "時計": "clock", "本": "book", "電球": "bulb",
+    "歯車": "gear", "ギア": "gear",
+}
+
+_MOTIF_KEYWORDS = [
+    ("checklist", ("やること", "チェック", "todo", "タスク", "リスト", "予定")),
+    ("robot", ("ロボット", "ジャービス", "相棒", "ai", "エーアイ", "人工知能")),
+    ("enter", ("エンター", "決定", "実行する", "押す")),
+    ("keyboard", ("キーボード", "タイピング", "入力", "打つ")),
+    ("laptop", ("パソコン", "pc", "コンピュータ", "画面", "ノート")),
+    ("folder", ("フォルダ", "整理", "しまう", "保管")),
+    ("magnifier", ("調べ", "検索", "探す", "探し", "見つけ")),
+    ("clock", ("時間", "時計", "朝", "夜", "何時", "スケジュール")),
+    ("book", ("本", "読書", "勉強", "学ぶ", "知識")),
+    ("bulb", ("アイデア", "ひらめき", "思いつ", "工夫")),
+    ("gear", ("設定", "仕組み", "機械", "しくみ")),
+    ("document", ("ファイル", "文書", "ドキュメント", "書類", "メモ")),
+]
+
+
+def choose_motif(explicit="", text=""):
+    """
+    絵の指定（日本語名や英語名）→ キーワード推定 → 既定（ファイル）の順で選ぶ。
+    戻り値は MOTIF_NAMES のどれか。
+    """
+    e = (explicit or "").strip()
+    if e:
+        if e.lower() in MOTIF_NAMES:
+            return e.lower()
+        for ja, name in _MOTIF_JA.items():
+            if ja in e:
+                return name
+    t = (text or "").lower()
+    for name, keys in _MOTIF_KEYWORDS:
+        for k in keys:
+            if k in t:
+                return name
+    return "document"
+
+
+# ---------------------------------------------------------------------------
+# ナレーションの掃除・文分割・長さ推定
+# ---------------------------------------------------------------------------
+
+def clean_narration_text(text):
+    """読み上げ文章から記号類を落とす（文の上限は付けない版）。"""
+    t = strip_think(text or "")
+    t = _FENCE_RE.sub(" ", t)
+    t = _FENCE_OPEN_RE.sub(" ", t)
+    kept = []
+    for line in t.splitlines():
+        s = line.strip()
+        if not s or _is_action_line(s):
+            continue
+        kept.append(s)
+    t = " ".join(kept)
+    t = _LINK_RE.sub(r"\1", t)
+    t = _URL_RE.sub(" ", t)
+    t = _INLINE_CODE_RE.sub(" ", t)
+    t = _MD_CHARS_RE.sub("", t)
+    t = _SYMBOL_RE.sub("", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def split_narration_sentences(text):
+    """
+    字幕同期用に、ナレーションを文に分ける。
+    。！？で区切り、長すぎる文は「、」でも区切る。
+    """
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    if not t:
+        return []
+    raw = [s.strip() for s in re.split(r"(?<=[。！？])", t) if s.strip()]
+    out = []
+    for s in raw:
+        while len(s) > 60:
+            cut = s.rfind("、", 20, 60)
+            if cut < 0:
+                break
+            out.append(s[:cut + 1].strip())
+            s = s[cut + 1:].strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def estimate_narration_sec(text):
+    """声が作れなかった時の代わりの長さ推定（日本語 約6.5文字/秒）。"""
+    n = len(text or "")
+    return max(1.2, min(10.0, n / 6.5))
+
+
+# ---------------------------------------------------------------------------
+# 段階プラン（場面×文 → フレーム列）
+# ---------------------------------------------------------------------------
+# level: 1=紙+モチーフ / 2=+タイトルカード / 3=+箇条書きカード（全部）
+# 字幕帯は全段階に出る（その文そのもの）。
+
+def build_stage_plan(scene_sentences):
+    """
+    scene_sentences: [[(文, 秒 or None), ...], ...]（場面ごとの文と声の長さ）
+    戻り値: (stages, total_sec)
+      stages: [{"scene":i, "sentence":j, "level":1..3, "caption":文, "duration":秒}]
+    秒が None の文は推定で埋める。場面の最後の段階に VIDEO_STAGE_PAD を足す。
+    文が無い場面は、全部入りの1段階（3秒、字幕なし）にする。
+    """
+    stages = []
+    total = 0.0
+    for i, sentences in enumerate(scene_sentences):
+        if not sentences:
+            stages.append({"scene": i, "sentence": -1, "level": 3,
+                           "caption": "", "duration": 3.0})
+            total += 3.0
+            continue
+        for j, (caption, dur) in enumerate(sentences):
+            d = float(dur) if dur else estimate_narration_sec(caption)
+            last = j == len(sentences) - 1
+            if last:
+                d += VIDEO_STAGE_PAD
+            # 段階は文ごとに 1→2→3 と増え、場面の最後は必ず全部入り（3）にする
+            # （文が少ない場面でも、タイトルと箇条書きが必ず出るように）
+            level = 3 if last else min(j + 1, 3)
+            stages.append({"scene": i, "sentence": j, "level": level,
+                           "caption": caption, "duration": d})
+            total += d
+    return stages, total
+
+
+# ---------------------------------------------------------------------------
+# テンプレートの種・切り貼りの計画・破れ紙の輪郭
+# ---------------------------------------------------------------------------
+
+def video_seed_for(theme):
+    """テーマ文字列から決まる種。同じテーマなら同じデザインになる。"""
+    return zlib.crc32((theme or "").encode("utf-8")) & 0xFFFFFFFF
+
+
+def plan_scraps(seed, width, height, count=7):
+    """
+    背景に貼る切り貼りの計画（位置・大きさ・色）。描画はしない純粋関数。
+    種が同じなら必ず同じ計画になる。
+    """
+    rng = random.Random(seed)
+    scraps = []
+    for _ in range(count):
+        w = rng.randint(int(width * 0.16), int(width * 0.34))
+        h = rng.randint(int(height * 0.05), int(height * 0.13))
+        x = rng.randint(-int(w * 0.35), max(0, width - int(w * 0.55)))
+        y = rng.randint(0, max(0, height - h))
+        scraps.append({
+            "x": x, "y": y, "w": w, "h": h,
+            "color": SCRAP_COLORS[rng.randrange(len(SCRAP_COLORS))],
+            "jseed": rng.randrange(1 << 30),
+        })
+    return scraps
+
+
+def torn_rect_points(x, y, w, h, rng, jag=None):
+    """破れた紙の輪郭（長方形の各辺にギザギザを付ける）。rng は random.Random。"""
+    if jag is None:
+        jag = max(3, int(min(w, h) * 0.045))
+    pts = []
+
+    def edge(x1, y1, x2, y2, n):
+        for i in range(n):
+            t = i / float(n)
+            px = x1 + (x2 - x1) * t + rng.randint(-jag, jag)
+            py = y1 + (y2 - y1) * t + rng.randint(-jag, jag)
+            pts.append((px, py))
+
+    edge(x, y, x + w, y, 6)
+    edge(x + w, y, x + w, y + h, 5)
+    edge(x + w, y + h, x, y + h, 6)
+    edge(x, y + h, x, y, 5)
+    return pts
+
+
+def video_output_name(theme):
+    """video_<テーマ要約>.mp4 の形の、安全なファイル名を作る。"""
+    rel = sanitize_relpath(theme or "")
+    base = rel.split("/")[0] if rel else ""
+    base = re.sub(r'[<>:"/\\|?*]', "", base)
+    base = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", base)  # 無題.txt のような拡張子を落とす
+    base = re.sub(r"\s+", "_", base).strip("._ ")
+    if not base or base == "無題":  # 「無題」は sanitize の既定名なので、テーマ無し扱い
+        base = "説明"
+    return "video_%s.mp4" % base[:20]
+
+
+# ---------------------------------------------------------------------------
+# フォントと文字の折り返し
+# ---------------------------------------------------------------------------
+
+_FONT_PATHS = {
+    False: ("C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/meiryo.ttc",
+            "C:/Windows/Fonts/msgothic.ttc"),
+    True: ("C:/Windows/Fonts/YuGothB.ttc", "C:/Windows/Fonts/meiryob.ttc",
+           "C:/Windows/Fonts/YuGothM.ttc"),
+}
+
+
+def get_japanese_font(size, bold=False):
+    """
+    日本語フォントを返す。Windows の Yu Gothic / Meiryo を優先し、
+    無ければ Pillow の既定フォント（その旨は呼び出し側で案内する）。
+    """
+    try:
+        from PIL import ImageFont
+    except Exception:
+        return None
+    for path in _FONT_PATHS[bool(bold)]:
+        try:
+            if os.path.isfile(path):
+                return ImageFont.truetype(path, int(size))
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=int(size))
+    except Exception:
+        try:
+            return ImageFont.load_default()
+        except Exception:
+            return None
+
+
+def font_available():
+    """Yu Gothic / Meiryo のどちらかが見える環境か。"""
+    return any(os.path.isfile(p) for paths in _FONT_PATHS.values() for p in paths)
+
+
+def wrap_text_by_width(text, max_width, width_of):
+    """
+    width_of(文字列)->ピクセル幅 を使って折り返す。単独で長すぎる文字並びは
+    1文字ずつでも切る。改行コードは段落として扱う。
+    """
+    out = []
+    for para in (text or "").split("\n"):
+        if not para:
+            out.append("")
+            continue
+        line = ""
+        for ch in para:
+            if ch == "\n":
+                continue
+            if line and width_of(line + ch) > max_width:
+                out.append(line)
+                line = ch
+            else:
+                line += ch
+        out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# WAV の長さ・無音 WAV・声の合成（ファイル出力版）
+# ---------------------------------------------------------------------------
+
+def wav_duration_sec(path):
+    """WAV ファイルの長さ（秒）。読めなければ 0.0。"""
+    try:
+        with wave.open(path, "rb") as w:
+            rate = w.getframerate()
+            if rate <= 0:
+                return 0.0
+            return w.getnframes() / float(rate)
+    except Exception:
+        return 0.0
+
+
+def write_silent_wav(path, seconds, rate=24000):
+    """無音の WAV を書く。声が作れなかった場面の長さ合わせ用。"""
+    try:
+        frames = max(1, int(seconds * rate))
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(b"\x00\x00" * frames)
+        return True
+    except Exception:
+        return False
+
+
+def voicevox_wav_bytes(text, speaker_id=DEFAULT_SPEAKER):
+    """VOICEVOX で合成して WAV バイト列を返す。失敗は None。"""
+    try:
+        q = urllib.parse.urlencode({"text": text, "speaker": int(speaker_id)})
+        raw = _http(VOICEVOX_BASE + "/audio_query?" + q, data=b"", timeout=15)
+        query = json.loads(raw.decode("utf-8"))
+        body = json.dumps(query).encode("utf-8")
+        q2 = urllib.parse.urlencode({"speaker": int(speaker_id)})
+        req = urllib.request.Request(
+            VOICEVOX_BASE + "/synthesis?" + q2, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            wav = r.read()
+        return wav or None
+    except Exception:
+        return None
+
+
+def sapi_wav_file(text, out_path):
+    """Windows 標準音声（SAPI）で WAV ファイルに書き出す。窓は出さない。"""
+    if sys.platform != "win32":
+        return False
+    safe_text = (text or "").replace("'", "''").replace("\r", " ").replace("\n", " ")
+    safe_path = (out_path or "").replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "try { $s.SelectVoice('Microsoft Haruka Desktop') } catch { "
+        "  try { $s.SelectVoice('Microsoft Haruka') } catch {} }; "
+        "$s.SetOutputToWaveFile('" + safe_path + "'); "
+        "$s.Speak('" + safe_text + "'); "
+        "$s.SetOutputToNull(); $s.Dispose()"
+    )
+    try:
+        cp = run_hidden(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+        return cp.returncode == 0 and os.path.isfile(out_path) \
+            and os.path.getsize(out_path) > 1000
+    except Exception:
+        return False
+
+
+def synthesize_narration_wav(text, speaker_id, out_path):
+    """VOICEVOX → SAPI の順に試して WAV を作る。成功したら True。"""
+    wav = voicevox_wav_bytes(text, speaker_id)
+    if wav:
+        try:
+            with open(out_path, "wb") as f:
+                f.write(wav)
+            return True
+        except OSError:
+            pass
+    return sapi_wav_file(text, out_path)
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg の引数づくり（純粋関数。実行は呼び出し側）
+# ---------------------------------------------------------------------------
+
+def build_segment_args(ffmpeg, png_path, wav_path, duration, out_path):
+    """静止画1枚 + 声1つ → 均一な区間 mp4 の引数。"""
+    return [
+        ffmpeg, "-y",
+        "-loop", "1", "-i", png_path,
+        "-i", wav_path,
+        "-t", "%.3f" % float(duration),
+        "-r", str(VIDEO_FPS),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-af", "apad", "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        out_path,
+    ]
+
+
+def build_concat_list(paths):
+    """concat デマルチプレクサ用のリスト文字列（パスは / 区切りに直す）。"""
+    lines = []
+    for p in paths:
+        esc = str(p).replace("\\", "/").replace("'", "'\\''")
+        lines.append("file '%s'" % esc)
+    return "\n".join(lines) + "\n"
+
+
+def build_concat_args(ffmpeg, list_path, out_path):
+    """区間を並べて1本にする（再エンコード）引数。xfade がダメな時の予備。"""
+    return [
+        ffmpeg, "-y",
+        "-f", "concat", "-safe", "0", "-i", list_path,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
+        out_path,
+    ]
+
+
+def build_xfade_filter(durations, fade=VIDEO_FADE_SEC):
+    """
+    全区間をクロスフェードでつなぐ filter_complex を作る。
+    戻り値: (filter文字列, 合計秒) / 作れない時（区間が1つ・短すぎ）は None。
+    """
+    ds = [float(d) for d in durations]
+    if len(ds) < 2:
+        return None
+    eff = min(float(fade), min(ds) * 0.3)
+    if eff < 0.05:
+        return None
+    parts = []
+    n = len(ds)
+    for i in range(1, n):
+        offset = sum(ds[:i]) - eff * i
+        vlabel = "vout" if i == n - 1 else "xv%d" % i
+        prev = "0:v" if i == 1 else "xv%d" % (i - 1)
+        parts.append("[%s][%d:v]xfade=transition=fade:duration=%.3f:offset=%.3f[%s]"
+                     % (prev, i, eff, offset, vlabel))
+    for i in range(1, n):
+        alabel = "aout" if i == n - 1 else "xa%d" % i
+        prev = "0:a" if i == 1 else "xa%d" % (i - 1)
+        parts.append("[%s][%d:a]acrossfade=d=%.3f[%s]" % (prev, i, eff, alabel))
+    total = sum(ds) - eff * (n - 1)
+    return ";".join(parts), total
+
+
+def build_xfade_args(ffmpeg, segment_paths, durations, out_path, fade=VIDEO_FADE_SEC):
+    """xfade でつなぐ引数一式。作れない時は None。"""
+    built = build_xfade_filter(durations, fade)
+    if built is None:
+        return None
+    filt, _total = built
+    args = [ffmpeg, "-y"]
+    for p in segment_paths:
+        args += ["-i", p]
+    args += [
+        "-filter_complex", filt,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    return args
+
+
+# ---------------------------------------------------------------------------
+# モチーフ（絵）の図形描画ライブラリ
+# ---------------------------------------------------------------------------
+# 全部 Pillow の図形だけ。水彩の質感は出ない代わりに、色と形を紙の世界に統一する。
+# 座標は box (x, y, s) の中で 0.0〜1.0 の割合で描く。
+
+def _rgba(rgb, a=255):
+    return (rgb[0], rgb[1], rgb[2], a)
+
+
+_INK_A = _rgba(INK_COLOR)
+_ACCENT = (232, 122, 46)     # オレンジ
+_ACCENT2 = (70, 130, 190)    # 青
+_ACCENT3 = (96, 168, 110)    # 緑
+
+
+def _motif_robot(d, x, y, s, font):
+    lw = max(2, int(s * 0.018))
+    # アンテナ
+    cx = x + s * 0.5
+    d.line([cx, y + s * 0.20, cx, y + s * 0.06], fill=_INK_A, width=lw)
+    d.ellipse([cx - s * 0.045, y + s * 0.015, cx + s * 0.045, y + s * 0.105],
+              fill=_rgba(_ACCENT), outline=_INK_A, width=lw)
+    # 耳
+    d.rounded_rectangle([x + s * 0.07, y + s * 0.38, x + s * 0.16, y + s * 0.56],
+                        radius=s * 0.03, fill=_rgba(_ACCENT2), outline=_INK_A, width=lw)
+    d.rounded_rectangle([x + s * 0.84, y + s * 0.38, x + s * 0.93, y + s * 0.56],
+                        radius=s * 0.03, fill=_rgba(_ACCENT2), outline=_INK_A, width=lw)
+    # 頭
+    d.rounded_rectangle([x + s * 0.16, y + s * 0.20, x + s * 0.84, y + s * 0.68],
+                        radius=s * 0.10, fill=_rgba((235, 244, 250)), outline=_INK_A, width=lw)
+    # 目（にっこり）と口
+    for ex in (0.36, 0.64):
+        d.ellipse([x + s * (ex - 0.045), y + s * 0.375, x + s * (ex + 0.045), y + s * 0.465],
+                  fill=_INK_A)
+    d.arc([x + s * 0.40, y + s * 0.44, x + s * 0.60, y + s * 0.62],
+          start=15, end=165, fill=_INK_A, width=lw)
+    # ほっぺ
+    for ex in (0.24, 0.76):
+        d.ellipse([x + s * (ex - 0.05), y + s * 0.50, x + s * (ex + 0.05), y + s * 0.57],
+                  fill=_rgba((244, 178, 196), 160))
+    # 体
+    d.rounded_rectangle([x + s * 0.27, y + s * 0.70, x + s * 0.73, y + s * 0.96],
+                        radius=s * 0.07, fill=_rgba(_ACCENT2), outline=_INK_A, width=lw)
+    d.ellipse([x + s * 0.44, y + s * 0.76, x + s * 0.56, y + s * 0.88],
+              fill=_rgba((255, 240, 178)), outline=_INK_A, width=lw)
+
+
+def _motif_checklist(d, x, y, s, font):
+    lw = max(2, int(s * 0.016))
+    d.rounded_rectangle([x + s * 0.10, y + s * 0.06, x + s * 0.90, y + s * 0.94],
+                        radius=s * 0.05, fill=_rgba(CARD_PAPER), outline=_INK_A, width=lw)
+    for i, done in enumerate((True, True, False)):
+        ry = y + s * (0.18 + i * 0.26)
+        d.rounded_rectangle([x + s * 0.20, ry, x + s * 0.34, ry + s * 0.14],
+                            radius=s * 0.02, outline=_INK_A, width=lw,
+                            fill=_rgba((220, 240, 220)) if done else None)
+        if done:
+            d.line([x + s * 0.225, ry + s * 0.07, x + s * 0.26, ry + s * 0.115,
+                    x + s * 0.325, ry + s * 0.025], fill=_rgba(_ACCENT3), width=lw + 2)
+        d.rounded_rectangle([x + s * 0.42, ry + s * 0.03, x + s * 0.80, ry + s * 0.075],
+                            radius=s * 0.02, fill=_rgba((216, 206, 188)))
+        d.rounded_rectangle([x + s * 0.42, ry + s * 0.095, x + s * 0.68, ry + s * 0.125],
+                            radius=s * 0.015, fill=_rgba((228, 219, 203)))
+
+
+def _motif_laptop(d, x, y, s, font):
+    lw = max(2, int(s * 0.016))
+    d.rounded_rectangle([x + s * 0.12, y + s * 0.14, x + s * 0.88, y + s * 0.72],
+                        radius=s * 0.04, fill=_rgba((90, 100, 115)), outline=_INK_A, width=lw)
+    d.rounded_rectangle([x + s * 0.17, y + s * 0.19, x + s * 0.83, y + s * 0.67],
+                        radius=s * 0.02, fill=_rgba((222, 240, 250)))
+    d.rounded_rectangle([x + s * 0.22, y + s * 0.25, x + s * 0.60, y + s * 0.315],
+                        radius=s * 0.02, fill=_rgba(_ACCENT))
+    for i in range(3):
+        ry = y + s * (0.38 + i * 0.09)
+        d.rounded_rectangle([x + s * 0.22, ry, x + s * (0.78 - i * 0.08), ry + s * 0.045],
+                            radius=s * 0.02, fill=_rgba((170, 195, 215)))
+    d.polygon([(x + s * 0.05, y + s * 0.86), (x + s * 0.95, y + s * 0.86),
+               (x + s * 0.88, y + s * 0.72), (x + s * 0.12, y + s * 0.72)],
+              fill=_rgba((150, 160, 175)), outline=_INK_A)
+    d.rounded_rectangle([x + s * 0.42, y + s * 0.75, x + s * 0.58, y + s * 0.80],
+                        radius=s * 0.015, fill=_rgba((120, 130, 145)))
+
+
+def _motif_keyboard(d, x, y, s, font):
+    lw = max(2, int(s * 0.016))
+    d.rounded_rectangle([x + s * 0.05, y + s * 0.26, x + s * 0.95, y + s * 0.76],
+                        radius=s * 0.05, fill=_rgba((240, 238, 232)), outline=_INK_A, width=lw)
+    kw, kh = s * 0.135, s * 0.10
+    for r in range(3):
+        for c in range(5):
+            kx = x + s * 0.115 + c * s * 0.155
+            ky = y + s * 0.315 + r * s * 0.125
+            fill = _ACCENT if (r, c) == (1, 2) else (214, 208, 196)
+            d.rounded_rectangle([kx, ky, kx + kw, ky + kh], radius=s * 0.018,
+                                fill=_rgba(fill), outline=_INK_A, width=max(1, lw - 1))
+    d.rounded_rectangle([x + s * 0.28, y + s * 0.695 - s * 0.045, x + s * 0.72, y + s * 0.695 + s * 0.045],
+                        radius=s * 0.018, fill=_rgba((214, 208, 196)), outline=_INK_A,
+                        width=max(1, lw - 1))
+
+
+def _motif_enter(d, x, y, s, font):
+    lw = max(2, int(s * 0.02))
+    d.rounded_rectangle([x + s * 0.08, y + s * 0.30, x + s * 0.92, y + s * 0.70],
+                        radius=s * 0.07, fill=_rgba((253, 236, 166)), outline=_INK_A, width=lw)
+    # 折れ矢印（フォントに無い記号は線で描く）
+    d.line([x + s * 0.76, y + s * 0.42, x + s * 0.40, y + s * 0.42, x + s * 0.40, y + s * 0.60],
+           fill=_INK_A, width=lw + 2)
+    d.line([x + s * 0.315, y + s * 0.525, x + s * 0.40, y + s * 0.615, x + s * 0.485, y + s * 0.525],
+           fill=_INK_A, width=lw + 2)
+    if font is not None:
+        d.text((x + s * 0.60, y + s * 0.50), "ENTER", font=font, fill=_INK_A, anchor="ma")
+
+
+def _motif_folder(d, x, y, s, font):
+    lw = max(2, int(s * 0.016))
+    d.polygon([(x + s * 0.10, y + s * 0.30), (x + s * 0.42, y + s * 0.30),
+               (x + s * 0.50, y + s * 0.38), (x + s * 0.90, y + s * 0.38),
+               (x + s * 0.90, y + s * 0.82), (x + s * 0.10, y + s * 0.82)],
+              fill=_rgba((238, 196, 110)), outline=_INK_A)
+    d.polygon([(x + s * 0.06, y + s * 0.44), (x + s * 0.94, y + s * 0.44),
+               (x + s * 0.88, y + s * 0.88), (x + s * 0.12, y + s * 0.88)],
+              fill=_rgba((245, 215, 110)), outline=_INK_A)
+
+
+def _motif_document(d, x, y, s, font):
+    lw = max(2, int(s * 0.016))
+    for dx, dy, col in ((0.10, -0.03, (222, 214, 198)), (-0.08, 0.03, (232, 224, 208))):
+        d.rounded_rectangle([x + s * (0.26 + dx), y + s * (0.10 + dy),
+                             x + s * (0.74 + dx), y + s * (0.90 + dy)],
+                            radius=s * 0.03, fill=_rgba(col), outline=_INK_A, width=max(1, lw - 1))
+    d.rounded_rectangle([x + s * 0.24, y + s * 0.07, x + s * 0.76, y + s * 0.93],
+                        radius=s * 0.03, fill=_rgba(CARD_PAPER), outline=_INK_A, width=lw)
+    d.polygon([(x + s * 0.64, y + s * 0.07), (x + s * 0.76, y + s * 0.19), (x + s * 0.64, y + s * 0.19)],
+              fill=_rgba((216, 206, 188)), outline=_INK_A)
+    d.rounded_rectangle([x + s * 0.31, y + s * 0.26, x + s * 0.58, y + s * 0.325],
+                        radius=s * 0.02, fill=_rgba(_ACCENT))
+    for i in range(4):
+        ry = y + s * (0.42 + i * 0.11)
+        d.rounded_rectangle([x + s * 0.31, ry, x + s * (0.69 - (i % 2) * 0.10), ry + s * 0.05],
+                            radius=s * 0.02, fill=_rgba((206, 196, 178)))
+
+
+def _motif_magnifier(d, x, y, s, font):
+    lw = max(3, int(s * 0.03))
+    d.ellipse([x + s * 0.16, y + s * 0.12, x + s * 0.66, y + s * 0.62],
+              fill=_rgba((222, 240, 250), 200), outline=_INK_A, width=lw)
+    d.line([x + s * 0.60, y + s * 0.56, x + s * 0.86, y + s * 0.84],
+           fill=_rgba(_ACCENT), width=int(s * 0.09))
+    d.line([x + s * 0.60, y + s * 0.56, x + s * 0.86, y + s * 0.84],
+           fill=_INK_A, width=max(2, int(s * 0.02)))
+    # 中のきらめき
+    cx, cy = x + s * 0.36, y + s * 0.32
+    r1, r2 = s * 0.10, s * 0.028
+    d.polygon([(cx, cy - r1), (cx + r2, cy - r2), (cx + r1, cy), (cx + r2, cy + r2),
+               (cx, cy + r1), (cx - r2, cy + r2), (cx - r1, cy), (cx - r2, cy - r2)],
+              fill=_rgba((245, 197, 66)))
+
+
+def _motif_clock(d, x, y, s, font):
+    import math as _math
+    lw = max(2, int(s * 0.02))
+    cx, cy, r = x + s * 0.5, y + s * 0.5, s * 0.36
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_rgba(CARD_PAPER),
+              outline=_INK_A, width=lw)
+    for i in range(12):
+        a = _math.radians(i * 30)
+        r1 = r * (0.86 if i % 3 else 0.78)
+        d.line([cx + r1 * _math.cos(a), cy + r1 * _math.sin(a),
+                cx + r * 0.94 * _math.cos(a), cy + r * 0.94 * _math.sin(a)],
+               fill=_INK_A, width=max(2, lw - 1))
+    for ang, ln, wdt, col in ((-55, 0.55, lw + 2, _INK_A), (125, 0.78, lw, _rgba(_ACCENT))):
+        a = _math.radians(ang)
+        d.line([cx, cy, cx + r * ln * _math.cos(a), cy + r * ln * _math.sin(a)],
+               fill=col, width=wdt)
+    d.ellipse([cx - s * 0.03, cy - s * 0.03, cx + s * 0.03, cy + s * 0.03], fill=_INK_A)
+
+
+def _motif_book(d, x, y, s, font):
+    lw = max(2, int(s * 0.016))
+    d.polygon([(x + s * 0.50, y + s * 0.22), (x + s * 0.24, y + s * 0.14),
+               (x + s * 0.10, y + s * 0.18), (x + s * 0.10, y + s * 0.80),
+               (x + s * 0.24, y + s * 0.74), (x + s * 0.50, y + s * 0.82)],
+              fill=_rgba(CARD_PAPER), outline=_INK_A)
+    d.polygon([(x + s * 0.50, y + s * 0.22), (x + s * 0.76, y + s * 0.14),
+               (x + s * 0.90, y + s * 0.18), (x + s * 0.90, y + s * 0.80),
+               (x + s * 0.76, y + s * 0.74), (x + s * 0.50, y + s * 0.82)],
+              fill=_rgba((255, 248, 232)), outline=_INK_A)
+    d.line([x + s * 0.50, y + s * 0.22, x + s * 0.50, y + s * 0.82], fill=_INK_A, width=lw)
+    for i in range(3):
+        ry = y + s * (0.32 + i * 0.13)
+        d.line([x + s * 0.18, ry, x + s * 0.42, ry + s * 0.03], fill=_rgba((196, 184, 164)), width=lw)
+        d.line([x + s * 0.58, ry + s * 0.03, x + s * 0.82, ry], fill=_rgba((196, 184, 164)), width=lw)
+
+
+def _motif_bulb(d, x, y, s, font):
+    import math as _math
+    lw = max(2, int(s * 0.018))
+    cx, cy, r = x + s * 0.5, y + s * 0.42, s * 0.26
+    for i in range(8):
+        a = _math.radians(i * 45 + 10)
+        d.line([cx + (r + s * 0.05) * _math.cos(a), cy + (r + s * 0.05) * _math.sin(a),
+                cx + (r + s * 0.13) * _math.cos(a), cy + (r + s * 0.13) * _math.sin(a)],
+               fill=_rgba((245, 197, 66)), width=lw + 1)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_rgba((255, 240, 178)),
+              outline=_INK_A, width=lw)
+    d.rounded_rectangle([cx - s * 0.09, cy + r + s * 0.01, cx + s * 0.09, cy + r + s * 0.07],
+                        radius=s * 0.015, fill=_rgba((150, 160, 175)), outline=_INK_A, width=lw)
+    d.rounded_rectangle([cx - s * 0.07, cy + r + s * 0.09, cx + s * 0.07, cy + r + s * 0.14],
+                        radius=s * 0.015, fill=_rgba((120, 130, 145)), outline=_INK_A, width=lw)
+
+
+def _motif_gear(d, x, y, s, font):
+    import math as _math
+    cx, cy = x + s * 0.5, y + s * 0.5
+    r_out, r_in, r_hole = s * 0.36, s * 0.27, s * 0.12
+    pts = []
+    teeth = 8
+    for i in range(teeth):
+        a0 = _math.radians(i * (360.0 / teeth))
+        for da, rr in ((-13, r_in), (-13, r_out), (13, r_out), (13, r_in)):
+            a = a0 + _math.radians(da)
+            pts.append((cx + rr * _math.cos(a), cy + rr * _math.sin(a)))
+    d.polygon(pts, fill=_rgba((170, 180, 195)), outline=_INK_A)
+    d.ellipse([cx - r_hole, cy - r_hole, cx + r_hole, cy + r_hole],
+              fill=_rgba(PAPER_BASE), outline=_INK_A, width=max(2, int(s * 0.016)))
+
+
+_MOTIF_DRAWERS = {
+    "robot": _motif_robot, "checklist": _motif_checklist, "laptop": _motif_laptop,
+    "keyboard": _motif_keyboard, "enter": _motif_enter, "folder": _motif_folder,
+    "document": _motif_document, "magnifier": _motif_magnifier, "clock": _motif_clock,
+    "book": _motif_book, "bulb": _motif_bulb, "gear": _motif_gear,
+}
+
+
+def draw_motif(draw, name, x, y, s, font=None):
+    """モチーフを1つ描く。知らない名前はファイルの絵に落とす。"""
+    fn = _MOTIF_DRAWERS.get(name) or _motif_document
+    fn(draw, x, y, s, font)
+
+
+# ---------------------------------------------------------------------------
+# 紙ノート風フレームの描画
+# ---------------------------------------------------------------------------
+
+def _tape_piece(d, cx, cy, w, h):
+    """マスキングテープ1片（少し傾いた平行四辺形）。"""
+    skew = h * 0.35
+    d.polygon([(cx - w / 2, cy - h / 2 + skew * 0.2), (cx + w / 2, cy - h / 2 - skew * 0.2),
+               (cx + w / 2 - skew * 0.2, cy + h / 2), (cx - w / 2 + skew * 0.2, cy + h / 2)],
+              fill=TAPE_COLOR)
+
+
+def _paper_card(d, box, fill, radius=18, tape=True):
+    """影つきの紙カード + 上にテープ。box=(x, y, w, h)。"""
+    x, y, w, h = box
+    d.rounded_rectangle([x + 7, y + 10, x + w + 7, y + h + 10], radius=radius,
+                        fill=(0, 0, 0, 30))
+    d.rounded_rectangle([x, y, x + w, y + h], radius=radius,
+                        fill=_rgba(fill), outline=_rgba((216, 203, 178)), width=2)
+    if tape:
+        _tape_piece(d, x + w / 2, y + 2, w * 0.30, h * 0.10 + 12)
+
+
+def render_video_frame(scene, level, caption, size, seed):
+    """
+    1段階分のフレームを描く（PIL Image, RGB）。
+    scene: parse_video_script の1場面（motif は解決済みの名前でもよい）
+    level: 1=紙+モチーフ / 2=+タイトル / 3=+箇条書き
+    """
+    from PIL import Image, ImageDraw
+    W, H = int(size[0]), int(size[1])
+    img = Image.new("RGB", (W, H), PAPER_BASE)
+    base = ImageDraw.Draw(img)
+    step = 38
+    for gx in range(step // 2, W, step):
+        for gy in range(step // 2, H, step):
+            base.ellipse([gx - 2, gy - 2, gx + 2, gy + 2], fill=PAPER_DOT)
+
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    # 背景の切り貼り（種で決まる。場面ごとに少しずつ違う）
+    for sc in plan_scraps(seed, W, H):
+        rng = random.Random(sc["jseed"])
+        pts = torn_rect_points(sc["x"], sc["y"], sc["w"], sc["h"], rng)
+        shadow = [(px + 7, py + 9) for px, py in pts]
+        d.polygon(shadow, fill=(0, 0, 0, 26))
+        d.polygon(pts, fill=_rgba(sc["color"], 235))
+
+    tate = H >= W
+    if tate:
+        motif_box = (W * 0.24, H * 0.052, W * 0.52)
+        title_box = (W * 0.07, H * 0.338, W * 0.86, H * 0.104)
+        bullets_box = (W * 0.07, H * 0.468, W * 0.86, H * 0.295)
+        caption_box = (W * 0.04, H * 0.878, W * 0.92, H * 0.096)
+    else:
+        motif_box = (W * 0.05, H * 0.09, H * 0.64)
+        title_box = (W * 0.44, H * 0.09, W * 0.515, H * 0.21)
+        bullets_box = (W * 0.44, H * 0.355, W * 0.515, H * 0.44)
+        caption_box = (W * 0.04, H * 0.845, W * 0.92, H * 0.125)
+
+    title_font = get_japanese_font(int(min(W * 0.046, H * 0.050)), bold=True)
+    bullet_font = get_japanese_font(int(min(W * 0.033, H * 0.038)))
+    caption_font = get_japanese_font(int(min(W * 0.036, H * 0.040)), bold=True)
+    small_font = get_japanese_font(int(min(W * 0.026, H * 0.030)), bold=True)
+
+    def width_of(s, font):
+        try:
+            return d.textlength(s, font=font)
+        except Exception:
+            return len(s) * 10.0
+
+    # --- 段階1: モチーフの下地 + モチーフ + 場面番号 ---
+    mx, my, ms = motif_box
+    rng_panel = random.Random(seed + 777)
+    panel = torn_rect_points(mx - ms * 0.10, my - ms * 0.06, ms * 1.20, ms * 1.10, rng_panel)
+    d.polygon([(px + 7, py + 9) for px, py in panel], fill=(0, 0, 0, 26))
+    d.polygon(panel, fill=_rgba(MOTIF_SOFT, 255))
+    motif_name = scene.get("motif") or choose_motif(
+        scene.get("motif_raw", ""),
+        (scene.get("title", "") + " " + " ".join(scene.get("bullets", [])) + " "
+         + scene.get("narration", "")))
+    draw_motif(d, motif_name, mx, my, ms, font=small_font)
+    badge_r = min(W, H) * 0.045
+    bx, by = W * 0.925, H * 0.045
+    d.ellipse([bx - badge_r, by - badge_r, bx + badge_r, by + badge_r],
+              fill=_rgba(_ACCENT), outline=_rgba((255, 253, 247)), width=3)
+    d.text((bx, by), str(int(scene.get("index", 0)) + 1), font=small_font,
+           fill=(255, 255, 255, 255), anchor="mm")
+
+    # --- 段階2: タイトルカード ---
+    if level >= 2 and scene.get("title"):
+        _paper_card(d, title_box, CARD_PAPER)
+        tx, ty, tw, th = title_box
+        lines = wrap_text_by_width(scene["title"], tw - 48,
+                                   lambda s: width_of(s, title_font))[:2]
+        lh = (title_font.size if hasattr(title_font, "size") else 30) * 1.25
+        y0 = ty + (th - lh * len(lines)) / 2
+        for i, ln in enumerate(lines):
+            d.text((tx + tw / 2, y0 + i * lh), ln, font=title_font,
+                   fill=_INK_A, anchor="ma")
+
+    # --- 段階3: 箇条書きカード（付箋） ---
+    if level >= 3 and scene.get("bullets"):
+        _paper_card(d, bullets_box, NOTE_YELLOW)
+        tx, ty, tw, th = bullets_box
+        bsize = bullet_font.size if hasattr(bullet_font, "size") else 26
+        lh = bsize * 1.5
+        max_lines = max(1, int((th - 34) / lh))
+        lines = []
+        for b in scene["bullets"]:
+            wrapped = wrap_text_by_width("・" + b, tw - 44,
+                                         lambda s: width_of(s, bullet_font))
+            for k, ln in enumerate(wrapped):
+                lines.append(ln if k == 0 else "　" + ln)
+        lines = lines[:max_lines]
+        y0 = ty + 18
+        for i, ln in enumerate(lines):
+            d.text((tx + 22, y0 + i * lh), ln, font=bullet_font, fill=_INK_A, anchor="la")
+
+    # --- 字幕（紙テープの帯。その文だけを出す） ---
+    if caption:
+        cx, cy, cw, ch = caption_box
+        pts = torn_rect_points(cx, cy, cw, ch, random.Random(seed + 4242), jag=5)
+        d.polygon([(px + 5, py + 7) for px, py in pts], fill=(0, 0, 0, 30))
+        d.polygon(pts, fill=_rgba((255, 253, 247), 248))
+        csize = caption_font.size if hasattr(caption_font, "size") else 28
+        lines = wrap_text_by_width(caption, cw - 56,
+                                   lambda s: width_of(s, caption_font))[:3]
+        lh = csize * 1.28
+        y0 = cy + (ch - lh * len(lines)) / 2
+        for i, ln in enumerate(lines):
+            d.text((cx + cw / 2, y0 + i * lh), ln, font=caption_font,
+                   fill=_INK_A, anchor="ma")
+
+    return Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
 
 
 # ===========================================================================
@@ -2022,6 +2987,7 @@ AGENT_FORMAT_HINT = (
     "見て: 画面について聞きたいこと（目が設定されている時だけ）\n"
     "見てクリック: 押したい物の名前（目が設定されている時だけ）\n"
     "ページ: 開いているページへの質問\n"
+    "動画: 説明動画のテーマ（NotebookLM風のスライド+読み上げ動画を作ります。少し時間がかかります）\n"
     "前面: ウィンドウの題名の一部 / 閉じる: 題名の一部 / 最大化: 題名の一部 / 最小化: 題名の一部\n"
     "丸: x% y%（画面に丸を描く）\n"
     "線: x1% y1% x2% y2%\n"
@@ -2068,6 +3034,8 @@ class LlamaServer:
         self.mmproj_used = False
         if mmproj_path and os.path.isfile(mmproj_path):
             args += ["--mmproj", mmproj_path]
+            # llama.cpp 公式の警告に従い、画面認識（grounding）の精度のため画像トークンの下限を上げる
+            args += ["--image-min-tokens", "1024"]
             self.mmproj_used = True
         try:
             log_path = os.path.join(DATA_DIR, "llama-server.log")
@@ -2293,6 +3261,7 @@ class JarvisApp:
         self.voice_var = tk.BooleanVar(value=bool(self.cfg.get("voice_on", True)))
         self.agent_var = tk.BooleanVar(value=bool(self.cfg.get("agent_on", False)))
         self.listen_var = tk.BooleanVar(value=bool(self.cfg.get("listen_on", True)))
+        self.video_tate_var = tk.BooleanVar(value=bool(self.cfg.get("video_tate", True)))
         self.autostart_var = tk.BooleanVar(value=autostart_enabled())
         self.server_status_var = tk.StringVar(value="サーバー: 未起動")
         self.voicevox_status_var = tk.StringVar(value="VOICEVOX: 確認中…")
@@ -2327,6 +3296,7 @@ class JarvisApp:
         self.cfg["voice_on"] = bool(self.voice_var.get())
         self.cfg["agent_on"] = bool(self.agent_var.get())
         self.cfg["listen_on"] = bool(self.listen_var.get())
+        self.cfg["video_tate"] = bool(self.video_tate_var.get())
         try:
             self.cfg["speaker_id"] = int(self.speaker_var.get())
         except ValueError:
@@ -2464,6 +3434,7 @@ class JarvisApp:
         self.see_button = ttk.Button(win, text="画面を見る", command=self._on_see_screen)
         self.page_button = ttk.Button(win, text="ページを説明", command=self._on_explain_page)
         self.titles_button = ttk.Button(win, text="見せて説明", command=self._on_explain_titles)
+        self.video_button = ttk.Button(win, text="動画を作る", command=self._on_make_video)
 
         style = ttk.Style()
         try:
@@ -2515,6 +3486,7 @@ class JarvisApp:
         self.see_button.place(x=12, y=top + 330, width=100, height=28)
         self.page_button.place(x=116, y=top + 330, width=104, height=28)
         self.titles_button.place(x=224, y=top + 330, width=104, height=28)
+        self.video_button.place(x=12, y=top + 362, width=150, height=28)
 
     def _place_bubble(self):
         ox = self.root.winfo_x()
@@ -3022,6 +3994,8 @@ class JarvisApp:
             return self._act_see_click(act)
         if kind == "page":
             return self._act_page(act)
+        if kind == "make_video":
+            return self._act_make_video(act)
         if kind == "wait":
             self.stop_event.wait(act["seconds"])
             return "%.0f秒待ちました" % act["seconds"]
@@ -3273,6 +4247,205 @@ class JarvisApp:
             self._post_log(ans)
             return ans
         return "ページを読んだ答え: %s" % ans[:1500]
+
+    # -- 説明動画 ---------------------------------------------------------------
+    def _act_make_video(self, act):
+        theme = (act.get("theme") or "").strip()
+        if not theme:
+            return "動画のテーマが空でした"
+        _ok, msg = self._make_video_pipeline(theme)
+        return msg
+
+    def _on_make_video(self):
+        theme = self.input_entry.get().strip()
+        if not theme:
+            self._show_bubble()
+            self._post_sys("入力欄に動画のテーマを書いてから「動画を作る」を押してください。")
+            return
+        self.input_entry.delete(0, "end")
+        if self.busy:
+            self._post_sys("今、前の仕事をしています。")
+            return
+        if not self.server.healthy():
+            self._post_err("サーバーが準備できていません。")
+            return
+        self._show_bubble()
+        self._post_user("（動画を作る）%s" % theme)
+        self.busy = True
+        self.stop_event.clear()
+        self.globe.set_active(True)
+        threading.Thread(target=self._make_video_thread, args=(theme,), daemon=True).start()
+
+    def _make_video_thread(self, theme):
+        try:
+            ok, msg = self._make_video_pipeline(theme)
+            if ok:
+                self._post_jarvis(msg)
+                self._finish_turn(msg)
+            else:
+                self._post_err(msg)
+                self._finish_turn("")
+        except Exception as e:
+            self._post_err("動画づくりに失敗しました（%s）" % e)
+            self._finish_turn("")
+
+    def _run_ffmpeg(self, args, timeout=600):
+        """ffmpeg を窓なしで実行する。(成功か, 失敗理由)"""
+        try:
+            cp = run_hidden(args, capture_output=True, timeout=timeout)
+        except Exception as e:
+            return (False, str(e))
+        if cp.returncode != 0:
+            tail = _decode(cp.stderr)[-300:].replace("\n", " ")
+            return (False, "ffmpeg が失敗しました: %s" % tail)
+        return (True, "")
+
+    def _make_video_pipeline(self, theme):
+        """
+        説明動画づくり一式（ワーカースレッドで呼ぶ）。
+        台本→声→段階フレーム→区間→組み立て。(成功か, 結果メッセージ)
+        """
+        ffmpeg = ffmpeg_exe_path()
+        if not ffmpeg:
+            return (False, "動画づくりの道具（ffmpeg）が見つかりませんでした。"
+                           "同梱ファイルが壊れているかもしれません。")
+        size = VIDEO_SIZE_TATE if self.cfg.get("video_tate", True) else VIDEO_SIZE_YOKO
+        seed = video_seed_for(theme)
+
+        # 1) 台本
+        self._post_log("動画づくり: 台本を考えています…")
+        old_predict = self.cfg.get("n_predict", 1024)
+        try:
+            self.cfg["n_predict"] = max(int(old_predict), 2048)
+        except (TypeError, ValueError):
+            pass
+        try:
+            raw = self._ask_with_text_model(VIDEO_SCRIPT_SYSTEM,
+                                            build_video_script_prompt(theme))
+        except Exception as e:
+            return (False, "台本を作れませんでした（%s）" % e)
+        finally:
+            self.cfg["n_predict"] = old_predict
+        if self.stop_event.is_set():
+            return (False, "途中で止めました。")
+        scenes = parse_video_script(raw)[:VIDEO_MAX_SCENES]
+        if len(scenes) < 2:
+            return (False, "台本がうまく作れませんでした（場面が %d つしか取れませんでした）。"
+                           "テーマを少し変えて、もう一度頼んでみてください。" % len(scenes))
+        for i, sc in enumerate(scenes):
+            sc["index"] = i
+            sc["motif"] = choose_motif(sc.get("motif_raw", ""),
+                                       sc.get("title", "") + " " +
+                                       " ".join(sc.get("bullets", [])) + " " +
+                                       sc.get("narration", ""))
+            sc["narration"] = clean_narration_text(sc.get("narration", ""))
+        self._post_log("動画づくり: 台本ができました（%d場面）" % len(scenes))
+        if not font_available():
+            self._post_log("動画づくり: 日本語フォントが見つからず、仮の文字で描きます")
+
+        work = os.path.join(WORKSPACE_DIR, "_video_work")
+        try:
+            shutil.rmtree(work, ignore_errors=True)
+            os.makedirs(work, exist_ok=True)
+        except OSError as e:
+            return (False, "作業フォルダを作れませんでした（%s）" % e)
+
+        try:
+            # 2) 声（文ごとに作って、字幕と同期させる）
+            self._post_log("動画づくり: 声を作っています…")
+            speaker = self.cfg.get("speaker_id", 11)
+            scene_sentences = []
+            silent_scenes = []
+            for i, sc in enumerate(scenes):
+                if self.stop_event.is_set():
+                    return (False, "途中で止めました。")
+                sentences = split_narration_sentences(sc["narration"])
+                rows = []
+                scene_silent = False
+                for j, sent in enumerate(sentences):
+                    wav_path = os.path.join(work, "sent_%02d_%02d.wav" % (i, j))
+                    dur = None
+                    if synthesize_narration_wav(sent, speaker, wav_path):
+                        d = wav_duration_sec(wav_path)
+                        if d > 0.2:
+                            dur = d
+                    if dur is None:
+                        dur = estimate_narration_sec(sent)
+                        if write_silent_wav(wav_path, dur):
+                            scene_silent = True
+                        else:
+                            return (False, "声の置き場を作れませんでした")
+                    rows.append((sent, dur, wav_path))
+                scene_sentences.append(rows)
+                if scene_silent:
+                    silent_scenes.append(i + 1)
+            if silent_scenes:
+                self._post_log("動画づくり: %s場面目は声が作れず、無音にしました"
+                               % "、".join(str(n) for n in silent_scenes))
+
+            # 3) 段階プラン → フレーム → 区間 mp4
+            plan_input = [[(sent, dur) for sent, dur, _p in rows]
+                          for rows in scene_sentences]
+            stages, total_sec = build_stage_plan(plan_input)
+            wav_of = {}
+            for i, rows in enumerate(scene_sentences):
+                for j, (_s, _d, p) in enumerate(rows):
+                    wav_of[(i, j)] = p
+            self._post_log("動画づくり: スライドを描いて、つないでいます…")
+            seg_paths = []
+            seg_durs = []
+            for k, st in enumerate(stages):
+                if self.stop_event.is_set():
+                    return (False, "途中で止めました。")
+                sc = scenes[st["scene"]]
+                png_path = os.path.join(work, "stage_%03d.png" % k)
+                img = render_video_frame(sc, st["level"], st["caption"], size,
+                                         seed + st["scene"] * 100003)
+                img.save(png_path)
+                if st["sentence"] >= 0:
+                    wav_path = wav_of[(st["scene"], st["sentence"])]
+                else:
+                    wav_path = os.path.join(work, "silent_%03d.wav" % k)
+                    write_silent_wav(wav_path, st["duration"])
+                seg_path = os.path.join(work, "seg_%03d.mp4" % k)
+                ok, why = self._run_ffmpeg(build_segment_args(
+                    ffmpeg, png_path, wav_path, st["duration"], seg_path), timeout=180)
+                if not ok:
+                    return (False, "動画の部品作りに失敗しました（%s）" % why)
+                seg_paths.append(seg_path)
+                seg_durs.append(st["duration"])
+
+            # 4) 組み立て（クロスフェード → ダメなら単純連結）
+            out_name = video_output_name(theme)
+            out_path = safe_join(WORKSPACE_DIR, out_name)
+            if out_path is None:
+                return (False, "安全のため、その場所には保存できませんでした")
+            made = False
+            xargs = build_xfade_args(ffmpeg, seg_paths, seg_durs, out_path)
+            if xargs is not None:
+                ok, _why = self._run_ffmpeg(xargs, timeout=600)
+                made = ok and os.path.isfile(out_path)
+            if not made:
+                list_path = os.path.join(work, "list.txt")
+                with open(list_path, "w", encoding="utf-8") as f:
+                    f.write(build_concat_list(seg_paths))
+                ok, why = self._run_ffmpeg(
+                    build_concat_args(ffmpeg, list_path, out_path), timeout=600)
+                if not ok:
+                    return (False, "動画の組み立てに失敗しました（%s）" % why)
+            if not os.path.isfile(out_path) or os.path.getsize(out_path) < 10000:
+                return (False, "動画ファイルがうまくできませんでした")
+            msg = ("説明動画ができました: %s（約%d秒、%d場面、%s）"
+                   % (out_name, int(round(total_sec)), len(scenes),
+                      "縦長" if size == VIDEO_SIZE_TATE else "横長"))
+            if silent_scenes:
+                msg += "。%s場面目は声なしです" % "、".join(str(n) for n in silent_scenes)
+            self._post_log("動画づくり: 完成しました（%s）" % out_name)
+            if self.desktop_win is not None:
+                self.ui(self.refresh_desktop)
+            return (True, msg)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
     # ------------------------------------------------------------------
@@ -3599,6 +4772,8 @@ class JarvisApp:
                         command=self._save_cfg).grid(row=7, column=0, sticky="w", **pad)
         ttk.Checkbutton(f, text="エージェントモード", variable=self.agent_var,
                         command=self._save_cfg).grid(row=7, column=1, sticky="w", **pad)
+        ttk.Checkbutton(f, text="説明動画は縦長", variable=self.video_tate_var,
+                        command=self._save_cfg).grid(row=7, column=2, sticky="w", **pad)
         ttk.Checkbutton(f, text="ずっと聞き耳", variable=self.listen_var,
                         command=lambda: self._set_listen(bool(self.listen_var.get()))
                         ).grid(row=8, column=0, sticky="w", **pad)

@@ -1,3 +1,4 @@
 vosk
 sounddevice
 pillow
+imageio-ffmpeg

@@ -9,7 +9,7 @@ datas = [
 ]
 binaries = []
 hiddenimports = []
-for _pkg in ('vosk', 'sounddevice'):
+for _pkg in ('vosk', 'sounddevice', 'imageio_ffmpeg'):
     _d, _b, _h = collect_all(_pkg)
     datas += _d
     binaries += _b
